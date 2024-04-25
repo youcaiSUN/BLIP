@@ -19,6 +19,8 @@ import torch.nn.functional as F
 import os
 from urllib.parse import urlparse
 from timm.models.hub import download_cached_file
+from einops import rearrange
+
 
 class BLIP_Base(nn.Module):
     def __init__(self,                 
@@ -104,7 +106,7 @@ class BLIP_Decoder(nn.Module):
         
     def forward(self, image, caption):
         
-        image_embeds = self.visual_encoder(image) 
+        image_embeds = self.visual_encoder(image)
         image_atts = torch.ones(image_embeds.size()[:-1],dtype=torch.long).to(image.device)
         
         text = self.tokenizer(caption, padding='longest', truncation=True, max_length=40, return_tensors="pt").to(image.device) 
@@ -125,8 +127,31 @@ class BLIP_Decoder(nn.Module):
         
         return loss_lm
         
-    def generate(self, image, sample=False, num_beams=3, max_length=30, min_length=10, top_p=0.9, repetition_penalty=1.0):
-        image_embeds = self.visual_encoder(image)
+    def generate(self, image, sample=False, num_beams=3, max_length=30, min_length=10, top_p=0.9, repetition_penalty=1.0,
+                 temporal_pooling=None):
+        batch_size = image.size(0)
+        if image.ndim == 4:
+            image_embeds = self.visual_encoder(image) # (bt) n d
+        else: # support video encoding
+            image = rearrange(image, 'b t c h w -> (b t) c h w')
+            image_embeds = self.visual_encoder(image) # (bt) n d
+            image = rearrange(image, '(b t) c h w -> b t c h w', b=batch_size)
+
+            # perform temporal pooling if needed
+            if temporal_pooling is None:
+                # concate tokens of all frames
+                image_embeds = rearrange(image_embeds, '(b t) n d -> b (t n) d', b=batch_size)
+            else:
+                image_embeds = rearrange(image_embeds, '(b t) n d -> b t n d', b=batch_size)
+                if temporal_pooling.lower() == 'avg':
+                    image_embeds = torch.mean(image_embeds, dim=1) # (b n d)
+                elif temporal_pooling.lower() == 'max':
+                    image_embeds = torch.max(image_embeds, dim=1)[0] # (b n d)
+                elif temporal_pooling.lower() == 'min':
+                    image_embeds = torch.min(image_embeds, dim=1)[0] # (b n d)
+                else:
+                    raise NotImplementedError
+
 
         if not sample:
             image_embeds = image_embeds.repeat_interleave(num_beams,dim=0)
@@ -184,7 +209,9 @@ def blip_feature_extractor(pretrained='',**kwargs):
     return model        
 
 def init_tokenizer():
-    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+    # tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+    # use local cached model
+    tokenizer = BertTokenizer.from_pretrained('/data/ycs/HuggingFace/bert-base-uncased')
     tokenizer.add_special_tokens({'bos_token':'[DEC]'})
     tokenizer.add_special_tokens({'additional_special_tokens':['[ENC]']})       
     tokenizer.enc_token_id = tokenizer.additional_special_tokens_ids[0]  
